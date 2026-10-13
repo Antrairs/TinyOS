@@ -1,5 +1,5 @@
-use core::ptr::{NonNull, read_volatile, write_volatile};
-
+use core::arch::asm;
+use core::ptr::{NonNull, addr_of_mut, read_volatile, write_volatile};
 use core::str::from_utf8;
 
 use crate::block::{BlockDevice, SECTOR_SIZE};
@@ -55,6 +55,35 @@ static mut DESC_MEM: DescMemory = DescMemory([0; 128]);
 static mut AVAIL_MEM: AvailMemory = AvailMemory([0; 22]);
 static mut USED_MEM: UsedMemory = UsedMemory([0; 70]);
 
+// VirtIO 描述符：16 字节
+#[repr(C)]
+struct Desc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+// 磁盘请求头：16 字节
+#[repr(C)]
+struct BlkReq {
+    kind: u32, // 0 = 读取
+    reserved: u32,
+    sector: u64,
+}
+
+#[repr(align(16))]
+struct DataMemory([u8; 512]);
+
+static mut READ_REQ: BlkReq = BlkReq {
+    kind: 0,
+    reserved: 0,
+    sector: 0,
+};
+
+static mut READ_DATA: DataMemory = DataMemory([0; 512]);
+static mut READ_STATUS: u8 = 0xff;
+
 // 将 64 位物理地址写入两个 32 位 MMIO 寄存器
 fn write_addr(base: usize, offset: usize, addr: u64) {
     write_reg(base, offset, addr as u32);
@@ -91,6 +120,122 @@ fn setup_queue(base: usize) -> bool {
     read_reg(base, 0x044) == 1
 }
 
+fn test_read_sector0(base: usize) -> bool {
+    let desc = addr_of_mut!(DESC_MEM) as *mut Desc;
+    let avail = addr_of_mut!(AVAIL_MEM) as *mut u8;
+    let used = addr_of_mut!(USED_MEM) as *mut u8;
+
+    let req_addr = addr_of_mut!(READ_REQ) as u64;
+    let data_addr = addr_of_mut!(READ_DATA) as u64;
+    let status_addr = addr_of_mut!(READ_STATUS) as u64;
+
+    unsafe {
+        // 1. 准备读取请求
+        write_volatile(
+            addr_of_mut!(READ_REQ),
+            BlkReq {
+                kind: 0, // VIRTIO_BLK_T_IN
+                reserved: 0,
+                sector: 0,
+            },
+        );
+        write_volatile(addr_of_mut!(READ_STATUS), 0xff);
+
+        // 2. 三个描述符组成 0 -> 1 -> 2
+        write_volatile(
+            desc.add(0),
+            Desc {
+                addr: req_addr,
+                len: 16,
+                flags: 1, // NEXT
+                next: 1,
+            },
+        );
+
+        write_volatile(
+            desc.add(1),
+            Desc {
+                addr: data_addr,
+                len: 512,
+                flags: 3, // NEXT | WRITE
+                next: 2,
+            },
+        );
+
+        write_volatile(
+            desc.add(2),
+            Desc {
+                addr: status_addr,
+                len: 1,
+                flags: 2, // WRITE
+                next: 0,
+            },
+        );
+
+        // 3. 记录当前队列索引
+        let avail_idx = read_volatile(avail.add(2) as *const u16);
+        let used_idx = read_volatile(used.add(2) as *const u16);
+
+        // 将描述符链的起点 0 放进 Available Ring
+        let slot = (avail_idx as usize) % QUEUE_SIZE;
+        write_volatile(avail.add(4 + slot * 2) as *mut u16, 0);
+
+        // 先发布描述符，再更新 avail.idx
+        asm!("fence iorw, iorw", options(nostack));
+        write_volatile(avail.add(2) as *mut u16, avail_idx.wrapping_add(1));
+
+        // 4. 通知设备：Queue 0 有新请求
+        asm!("fence iorw, iorw", options(nostack));
+        write_reg(base, 0x050, 0);
+
+        // 5. 等待设备完成
+        let expected = used_idx.wrapping_add(1);
+        let mut completed = false;
+
+        for _ in 0..10_000_000 {
+            if read_volatile(used.add(2) as *const u16) == expected {
+                completed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if !completed {
+            puts("[M4] Read timeout\n");
+            return false;
+        }
+
+        // 确保设备写入的结果对 CPU 可见
+        asm!("fence iorw, iorw", options(nostack));
+
+        // 确认完成的是 Descriptor 0 发起的请求
+        let used_slot = (used_idx as usize) % QUEUE_SIZE;
+        let completed_id = read_volatile(used.add(4 + used_slot * 8) as *const u32);
+
+        let status = read_volatile(addr_of_mut!(READ_STATUS));
+
+        if completed_id != 0 || status != 0 {
+            puts("[M4] Read failed\n");
+            return false;
+        }
+
+        puts("[M4] Sector 0 read OK\n");
+
+        // 6. 检查 FAT12 Boot Sector 签名
+        let data = addr_of_mut!(READ_DATA) as *const u8;
+        let lo = read_volatile(data.add(510));
+        let hi = read_volatile(data.add(511));
+
+        if lo == 0x55 && hi == 0xAA {
+            puts("[M4] Boot signature 55 AA found\n");
+        } else {
+            puts("[M4] No 55 AA signature (disk may be unformatted)\n");
+        }
+    }
+
+    true
+}
+
 fn print_hex(value: u32) {
     let digits = b"0123456789ABCDEF";
     let mut buf = *b"0x00000000";
@@ -102,7 +247,7 @@ fn print_hex(value: u32) {
     puts(from_utf8(&buf).unwrap());
 }
 
-pub fn test_m3(base: usize) -> bool {
+pub fn test_m4(base: usize) -> bool {
     const STATUS: usize = 0x070;
 
     // 1. 复位并声明自己是驱动
@@ -147,10 +292,13 @@ pub fn test_m3(base: usize) -> bool {
     let status = read_reg(base, STATUS);
     let ok = queue_ok && status & 15 == 15 && status & (64 | 128) == 0;
 
-    // 测试结束，复位后交给原有驱动
+    // M4：队列已经准备好，尝试读取 Sector 0
+    let read_ok = ok && test_read_sector0(base);
+
+    // 测试结束后复位，让原来的驱动重新初始化
     write_reg(base, STATUS, 0);
 
-    ok && read_reg(base, STATUS) == 0
+    read_ok && read_reg(base, STATUS) == 0
 }
 
 pub struct TinyHal;

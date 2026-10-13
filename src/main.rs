@@ -41,10 +41,10 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
-    if virtio::test_m3(base) {
-        puts("[M3] OK\n");
+    if virtio::test_m4(base) {
+        puts("[M4] OK\n");
     } else {
-        puts("[M3] FAILED\n");
+        puts("[M4] FAILED\n");
         halt();
     }
 
