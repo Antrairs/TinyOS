@@ -41,6 +41,8 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
+    virtio::debug_probe(base);
+
     let mut disk = match VirtioBlock::new(base) {
         Some(disk) => disk,
         None => {

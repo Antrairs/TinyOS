@@ -1,6 +1,11 @@
-use core::ptr::NonNull;
+use core::ptr::{
+    read_volatile, write_volatile, NonNull
+};
+
+use core::str::from_utf8;
 
 use crate::block::{BlockDevice, SECTOR_SIZE};
+use crate::shell::puts;
 
 use virtio_drivers::{
     BufferDirection, Hal, PAGE_SIZE, PhysAddr,
@@ -11,8 +16,6 @@ use virtio_drivers::{
     },
 };
 
-use core::ptr::read_volatile;
-
 const VIRTIO_BASE: usize = 0x1000_1000;
 const VIRTIO_SIZE: usize = 0x1000;
 const VIRTIO_COUNT: usize = 8;
@@ -20,6 +23,53 @@ const VIRTIO_COUNT: usize = 8;
 const MAGIC_VALUE: usize = 0x000;
 const VERSION: usize = 0x004;
 const DEVICE_ID: usize = 0x008;
+const VENDOR_ID: usize = 0x00C;
+const STATUS: usize = 0x070;
+
+fn print_hex(value: u32) {
+    let digits = b"0123456789ABCDEF";
+    let mut buf = *b"0x00000000";
+
+    for i in 0..8 {
+        let shift = 4 * (7 - i);
+        buf[i + 2] = digits[((value >> shift) & 0xF) as usize];
+    }
+    puts(from_utf8(&buf).unwrap());
+}
+
+pub fn debug_probe(base: usize) {
+    use crate::shell::puts;
+
+    puts("[M1] VirtIO-MMIO device found\n");
+
+    for (name, offset) in [
+        ("Base", 0), // 单独打印设备地址
+        ("Magic", MAGIC_VALUE),
+        ("Version", VERSION),
+        ("DeviceID", DEVICE_ID),
+        ("VendorID", VENDOR_ID),
+    ] {
+        puts("[M1] ");
+        puts(name);
+        puts(" = ");
+
+        let value = if name == "Base" {
+            base as u32
+        } else {
+            read_reg(base, offset)
+        };
+
+        print_hex(value);
+        puts("\n");
+    }
+
+    // 本测试在原有驱动初始化之前执行
+    write_reg(base, STATUS, 0);
+
+    puts("[M1] Status after reset = ");
+    print_hex(read_reg(base, STATUS));
+    puts("\n");
+}
 
 pub struct TinyHal;
 
@@ -102,6 +152,10 @@ impl BlockDevice for VirtioBlock {
 
 fn read_reg(base: usize, offset: usize) -> u32 {
     unsafe { read_volatile((base + offset) as *const u32) }
+}
+
+fn write_reg(base: usize, offset: usize, value: u32) {
+    unsafe { write_volatile((base + offset) as *mut u32, value) }
 }
 
 fn is_block_device(base: usize) -> bool {
