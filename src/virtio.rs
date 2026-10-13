@@ -1,6 +1,4 @@
-use core::ptr::{
-    read_volatile, write_volatile, NonNull
-};
+use core::ptr::{NonNull, read_volatile, write_volatile};
 
 use core::str::from_utf8;
 
@@ -40,6 +38,59 @@ const STATUS_FEATURES_OK: u32 = 8;
 const STATUS_NEEDS_RESET: u32 = 64;
 const STATUS_FAILED: u32 = 128;
 
+// 队列最多使用 8 个 Descriptor
+const QUEUE_SIZE: usize = 8;
+
+// 三个区域有不同的对齐要求
+#[repr(align(16))]
+struct DescMemory([u8; 128]);
+
+#[repr(align(2))]
+struct AvailMemory([u8; 22]);
+
+#[repr(align(4))]
+struct UsedMemory([u8; 70]);
+
+static mut DESC_MEM: DescMemory = DescMemory([0; 128]);
+static mut AVAIL_MEM: AvailMemory = AvailMemory([0; 22]);
+static mut USED_MEM: UsedMemory = UsedMemory([0; 70]);
+
+// 将 64 位物理地址写入两个 32 位 MMIO 寄存器
+fn write_addr(base: usize, offset: usize, addr: u64) {
+    write_reg(base, offset, addr as u32);
+    write_reg(base, offset + 4, (addr >> 32) as u32);
+}
+
+fn setup_queue(base: usize) -> bool {
+    // 1. 选择 Queue 0
+    write_reg(base, 0x030, 0);
+
+    // 2. 检查队列是否可用
+    if read_reg(base, 0x044) != 0 {
+        return false;
+    }
+    if read_reg(base, 0x034) < QUEUE_SIZE as u32 {
+        return false;
+    }
+
+    // 3. 取得三块静态内存的地址
+    let desc = core::ptr::addr_of_mut!(DESC_MEM) as u64;
+    let avail = core::ptr::addr_of_mut!(AVAIL_MEM) as u64;
+    let used = core::ptr::addr_of_mut!(USED_MEM) as u64;
+
+    // 4. 设置队列容量及物理地址
+    write_reg(base, 0x038, QUEUE_SIZE as u32);
+
+    write_addr(base, 0x080, desc);
+    write_addr(base, 0x090, avail);
+    write_addr(base, 0x0A0, used);
+
+    // 5. 启用队列
+    write_reg(base, 0x044, 1);
+
+    read_reg(base, 0x044) == 1
+}
+
 fn print_hex(value: u32) {
     let digits = b"0123456789ABCDEF";
     let mut buf = *b"0x00000000";
@@ -51,7 +102,7 @@ fn print_hex(value: u32) {
     puts(from_utf8(&buf).unwrap());
 }
 
-pub fn test_m2(base: usize) -> bool {
+pub fn test_m3(base: usize) -> bool {
     const STATUS: usize = 0x070;
 
     // 1. 复位并声明自己是驱动
@@ -79,12 +130,27 @@ pub fn test_m2(base: usize) -> bool {
     write_reg(base, STATUS, 11); // 1 | 2 | 8
 
     let status = read_reg(base, STATUS);
-    let ok = status & 8 != 0 && status & (64 | 128) == 0;
 
-    // 测试结束，复位，让旧驱动重新初始化
+    if status & 8 == 0 || status & (64 | 128) != 0 {
+        write_reg(base, STATUS, 0);
+        return false;
+    }
+
+    // M3：配置 Virtqueue
+    let queue_ok = setup_queue(base);
+
+    // 队列配置完成后，才能设置 DRIVER_OK
+    if queue_ok {
+        write_reg(base, STATUS, 15);
+    }
+
+    let status = read_reg(base, STATUS);
+    let ok = queue_ok && status & 15 == 15 && status & (64 | 128) == 0;
+
+    // 测试结束，复位后交给原有驱动
     write_reg(base, STATUS, 0);
 
-    ok
+    ok && read_reg(base, STATUS) == 0
 }
 
 pub struct TinyHal;
@@ -142,9 +208,7 @@ impl VirtioBlock {
     pub fn new(base: usize) -> Option<Self> {
         let header = NonNull::new(base as *mut VirtIOHeader)?;
 
-        let transport = unsafe {
-            MmioTransport::new(header, VIRTIO_SIZE).ok()?
-        };
+        let transport = unsafe { MmioTransport::new(header, VIRTIO_SIZE).ok()? };
 
         if transport.device_type() != DeviceType::Block {
             return None;
@@ -158,11 +222,15 @@ impl VirtioBlock {
 
 impl BlockDevice for VirtioBlock {
     fn read_sector(&mut self, sector: usize, buf: &mut [u8; SECTOR_SIZE]) {
-        self.inner.read_blocks(sector, buf).expect("VirtIO read failed");
+        self.inner
+            .read_blocks(sector, buf)
+            .expect("VirtIO read failed");
     }
 
     fn write_sector(&mut self, sector: usize, buf: &[u8; SECTOR_SIZE]) {
-        self.inner.write_blocks(sector, buf).expect("VirtIO write failed");
+        self.inner
+            .write_blocks(sector, buf)
+            .expect("VirtIO write failed");
     }
 }
 
