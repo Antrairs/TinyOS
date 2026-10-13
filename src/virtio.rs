@@ -24,7 +24,21 @@ const MAGIC_VALUE: usize = 0x000;
 const VERSION: usize = 0x004;
 const DEVICE_ID: usize = 0x008;
 const VENDOR_ID: usize = 0x00C;
+
+const DEVICE_FEATURES: usize = 0x010;
+const DEVICE_FEATURES_SEL: usize = 0x014;
+
+const DRIVER_FEATURES: usize = 0x020;
+const DRIVER_FEATURES_SEL: usize = 0x024;
+
 const STATUS: usize = 0x070;
+
+const STATUS_ACKNOWLEDGE: u32 = 1;
+const STATUS_DRIVER: u32 = 2;
+const STATUS_DRIVER_OK: u32 = 4;
+const STATUS_FEATURES_OK: u32 = 8;
+const STATUS_NEEDS_RESET: u32 = 64;
+const STATUS_FAILED: u32 = 128;
 
 fn print_hex(value: u32) {
     let digits = b"0123456789ABCDEF";
@@ -37,38 +51,40 @@ fn print_hex(value: u32) {
     puts(from_utf8(&buf).unwrap());
 }
 
-pub fn debug_probe(base: usize) {
-    use crate::shell::puts;
+pub fn test_m2(base: usize) -> bool {
+    const STATUS: usize = 0x070;
 
-    puts("[M1] VirtIO-MMIO device found\n");
+    // 1. 复位并声明自己是驱动
+    write_reg(base, STATUS, 0);
+    while read_reg(base, STATUS) != 0 {}
 
-    for (name, offset) in [
-        ("Base", 0), // 单独打印设备地址
-        ("Magic", MAGIC_VALUE),
-        ("Version", VERSION),
-        ("DeviceID", DEVICE_ID),
-        ("VendorID", VENDOR_ID),
-    ] {
-        puts("[M1] ");
-        puts(name);
-        puts(" = ");
+    write_reg(base, STATUS, 1); // ACKNOWLEDGE
+    write_reg(base, STATUS, 3); // ACKNOWLEDGE | DRIVER
 
-        let value = if name == "Base" {
-            base as u32
-        } else {
-            read_reg(base, offset)
-        };
-
-        print_hex(value);
-        puts("\n");
+    // 2. 检查设备是否支持现代 VirtIO（Feature 32）
+    write_reg(base, 0x014, 1);
+    if read_reg(base, 0x010) & 1 == 0 {
+        write_reg(base, STATUS, 0);
+        return false;
     }
 
-    // 本测试在原有驱动初始化之前执行
+    // 只启用 VERSION_1，其他可选功能都不启用
+    write_reg(base, 0x024, 0);
+    write_reg(base, 0x020, 0);
+
+    write_reg(base, 0x024, 1);
+    write_reg(base, 0x020, 1);
+
+    // 3. 检查设备是否接受
+    write_reg(base, STATUS, 11); // 1 | 2 | 8
+
+    let status = read_reg(base, STATUS);
+    let ok = status & 8 != 0 && status & (64 | 128) == 0;
+
+    // 测试结束，复位，让旧驱动重新初始化
     write_reg(base, STATUS, 0);
 
-    puts("[M1] Status after reset = ");
-    print_hex(read_reg(base, STATUS));
-    puts("\n");
+    ok
 }
 
 pub struct TinyHal;
@@ -155,7 +171,10 @@ fn read_reg(base: usize, offset: usize) -> u32 {
 }
 
 fn write_reg(base: usize, offset: usize, value: u32) {
-    unsafe { write_volatile((base + offset) as *mut u32, value) }
+    unsafe {
+        write_volatile((base + offset) as *mut u32, value);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+    }
 }
 
 fn is_block_device(base: usize) -> bool {

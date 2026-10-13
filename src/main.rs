@@ -7,7 +7,7 @@ use core::panic::PanicInfo;
 mod block;
 
 mod fat12;
-use fat12::{Fat12};
+use fat12::Fat12;
 
 mod virtio;
 use crate::virtio::VirtioBlock;
@@ -41,7 +41,12 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
-    virtio::debug_probe(base);
+    if virtio::test_m2(base) {
+        puts("[M2] OK\n");
+    } else {
+        puts("[M2] FAILED\n");
+        halt();
+    }
 
     let mut disk = match VirtioBlock::new(base) {
         Some(disk) => disk,
