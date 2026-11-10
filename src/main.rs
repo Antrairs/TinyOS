@@ -41,13 +41,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
     };
 
-    if virtio::test_m4(base) {
-        puts("[M4] OK\n");
-    } else {
-        puts("[M4] FAILED\n");
-        halt();
-    }
-
     let mut disk = match VirtioBlock::new(base) {
         Some(disk) => disk,
         None => {
