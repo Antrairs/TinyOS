@@ -31,7 +31,7 @@ SECTIONS
         . = ALIGN(16);
 
         __stack_bottom = .;
-        . += 16K;
+        . += 64K;
         __stack_top = .;
     }
 }
