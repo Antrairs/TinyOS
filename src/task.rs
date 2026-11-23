@@ -3,6 +3,8 @@ use core::mem::size_of;
 
 use crate::shell::puts;
 
+use crate::trap::{start_timer, stop_timer, read_time, disable_irq, enable_irq};
+
 const STACK_SIZE: usize = 4096;
 const CTX_FRAME_SIZE: usize = 112;
 
@@ -204,6 +206,7 @@ __switch:
 
     .global task_trampoline
 task_trampoline:
+    csrsi sstatus, 2
     mv a0, s1
     jalr s0
     call task_exit
@@ -342,7 +345,22 @@ fn schedule() {
     }
 }
 
+pub fn on_tick() {
+    unsafe {
+        let Some(cur) = KERNEL.current else {
+            return;
+        };
+        if KERNEL.tcbs[cur].state == TaskState::Running {
+            KERNEL.tcbs[cur].state = TaskState::Ready;
+            let prio = KERNEL.tcbs[cur].prio;
+            ready_push(cur, prio);
+        }
+    }
+    schedule();
+}
+
 fn task_yield() {
+    disable_irq();
     unsafe {
         if let Some(cur) = KERNEL.current {
             let state = KERNEL.tcbs[cur].state;
@@ -354,10 +372,12 @@ fn task_yield() {
         }
     }
     schedule();
+    enable_irq();
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn task_exit() -> ! {
+    disable_irq();
     unsafe {
         if let Some(cur) = KERNEL.current {
             task_delete(cur);
@@ -376,12 +396,17 @@ fn current_name() -> &'static str {
     }
 }
 
+fn busy_wait(cycles: u64) {
+    let end = read_time() + cycles;
+    while read_time() < end {}
+}
+
 extern "C" fn worker_task(rounds: usize) {
     for _ in 0..rounds {
         puts("[");
         puts(current_name());
         puts("] working\n");
-        task_yield();
+        busy_wait(1_000_000);
     }
     puts("[");
     puts(current_name());
@@ -404,6 +429,8 @@ pub fn sched(policy: SchedPolicy) {
     task_create("Worker2", worker_task, 2, 3);
     task_create("Worker3", worker_task, 3, 2);
     task_create("HeartBeat", heartbeat_task, 4, 4);
+    start_timer();
     schedule();
+    stop_timer();
     puts("sched done\n");
 }

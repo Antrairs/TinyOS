@@ -16,6 +16,7 @@ mod shell;
 use shell::puts;
 
 mod task;
+mod trap;
 
 global_asm!(
     r#"
