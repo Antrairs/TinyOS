@@ -15,6 +15,8 @@ use crate::virtio::VirtioBlock;
 mod shell;
 use shell::puts;
 
+mod task;
+
 global_asm!(
     r#"
     .section .text.entry

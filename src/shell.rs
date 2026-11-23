@@ -721,6 +721,9 @@ pub fn run(fs: &mut Fat12<'_>) {
                 puts("type   - show file content\n");
                 puts("format - format FAT12 disk\n");
             }
+            b"sched" => {
+                crate::task::demo();
+            }
             b"browse" => {
                 current_dir = browser(fs, current_dir);
             }
