@@ -37,25 +37,130 @@ impl Tcb {
     }
 }
 
+#[derive(Copy, Clone, PartialEq)]
+pub enum SchedPolicy {
+    Prio,
+    Rr,
+}
+
+struct PrioBitmap {
+    rdy_mask: u64,
+    prio_tid: [Option<usize>; 64],
+}
+
+impl PrioBitmap {
+    const fn new() -> Self {
+        Self {
+            rdy_mask: 0,
+            prio_tid: [None; 64],
+        }
+    }
+
+    fn push(&mut self, tid: usize, prio: u8) {
+        let p = prio as usize;
+        if p >= 64 {
+            return;
+        }
+        self.rdy_mask |= 1u64 << p;
+        self.prio_tid[p] = Some(tid);
+    }
+
+    fn remove(&mut self, prio: u8) {
+        let p = prio as usize;
+        if p >= 64 {
+            return;
+        }
+        self.rdy_mask &= !(1u64 << p);
+        self.prio_tid[p] = None;
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.rdy_mask == 0 {
+            return None;
+        }
+        let p = self.rdy_mask.trailing_zeros() as usize;
+        let tid = self.prio_tid[p];
+        self.remove(p as u8);
+        tid
+    }
+}
+
+struct RingQueue {
+    buf: [usize; MAX_TASKS],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl RingQueue {
+    const fn new() -> Self {
+        Self {
+            buf: [0; MAX_TASKS],
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, tid: usize) {
+        if self.len >= MAX_TASKS {
+            return;
+        }
+        self.buf[self.tail] = tid;
+        self.tail = (self.tail + 1) % MAX_TASKS;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        if self.len == 0 {
+            return None;
+        }
+        let tid = self.buf[self.head];
+        self.head = (self.head + 1) % MAX_TASKS;
+        self.len -= 1;
+        Some(tid)
+    }
+
+    fn remove(&mut self, target: usize) {
+        let mut new_len: usize = 0;
+        for i in 0..self.len {
+            let idx = (self.head + i) % MAX_TASKS;
+            let tid = self.buf[idx];
+            if tid != target {
+                self.buf[(self.head + new_len) % MAX_TASKS] = tid;
+                new_len += 1;
+            }
+        }
+        self.tail = (self.head + new_len) % MAX_TASKS;
+        self.len = new_len;
+    }
+}
+
 struct Kernel {
     tcbs: [Tcb; MAX_TASKS],
     used_mask: u32,
     current: Option<usize>,
     shell_sp: usize,
+    policy: SchedPolicy,
+    prio_q: PrioBitmap,
+    rr_q: RingQueue,
 }
 
 impl Kernel {
-    const fn new() -> Self {
+    const fn new(policy: SchedPolicy) -> Self {
         Self {
             tcbs: [Tcb::empty(); MAX_TASKS],
             used_mask: 0,
             current: None,
             shell_sp: 0,
+            policy,
+            prio_q: PrioBitmap::new(),
+            rr_q: RingQueue::new(),
         }
     }
 }
 
-static mut KERNEL: Kernel = Kernel::new();
+static mut KERNEL: Kernel = Kernel::new(SchedPolicy::Rr);
 static mut STACKS: [Stack; MAX_TASKS] = [const { Stack([0; STACK_SIZE]) }; MAX_TASKS];
 
 global_asm!(
@@ -126,6 +231,33 @@ fn init_stack(tid: usize, entry: extern "C" fn(usize), arg: usize) -> usize {
     sp
 }
 
+fn ready_push(tid: usize, prio: u8) {
+    unsafe {
+        match KERNEL.policy {
+            SchedPolicy::Prio => (*(&raw mut KERNEL.prio_q)).push(tid, prio),
+            SchedPolicy::Rr => (*(&raw mut KERNEL.rr_q)).push(tid),
+        }
+    }
+}
+
+fn ready_pop() -> Option<usize> {
+    unsafe {
+        match KERNEL.policy {
+            SchedPolicy::Prio => (*(&raw mut KERNEL.prio_q)).pop(),
+            SchedPolicy::Rr => (*(&raw mut KERNEL.rr_q)).pop(),
+        }
+    }
+}
+
+fn ready_remove(tid: usize, prio: u8) {
+    unsafe {
+        match KERNEL.policy {
+            SchedPolicy::Prio => (*(&raw mut KERNEL.prio_q)).remove(prio),
+            SchedPolicy::Rr => (*(&raw mut KERNEL.rr_q)).remove(tid),
+        }
+    }
+}
+
 fn task_create(
     name: &'static str,
     entry: extern "C" fn(usize),
@@ -145,6 +277,7 @@ fn task_create(
             prio,
             name,
         };
+        ready_push(tid, prio);
         Some(tid)
     }
 }
@@ -154,6 +287,12 @@ fn task_delete(tid: usize) {
         return;
     }
     unsafe {
+        let state = KERNEL.tcbs[tid].state;
+        if state == TaskState::Ready {
+            let prio = KERNEL.tcbs[tid].prio;
+            ready_remove(tid, prio);
+        }
+        
         KERNEL.used_mask &= !(1 << tid);
         KERNEL.tcbs[tid].state = TaskState::Unused;
     }
@@ -163,21 +302,7 @@ fn schedule() {
     unsafe {
         let prev = KERNEL.current;
 
-        // 从下一个槽位起顺扫一圈 找第一个 Ready 任务
-        let start = match prev {
-            Some(c) => (c + 1) % MAX_TASKS,
-            None => 0,
-        };
-
-        let mut next = None;
-        for offset in 0..MAX_TASKS {
-            let tid = (start + offset) % MAX_TASKS;
-            let state = KERNEL.tcbs[tid].state;
-            if state == TaskState::Ready {
-                next = Some(tid);
-                break;
-            }
-        }
+        let next = ready_pop();
 
         // 如果只剩当前任务自己直接恢复 Running
         if next == prev {
@@ -223,6 +348,8 @@ fn task_yield() {
             let state = KERNEL.tcbs[cur].state;
             if state == TaskState::Running {
                 KERNEL.tcbs[cur].state = TaskState::Ready;
+                let prio = KERNEL.tcbs[cur].prio;
+                ready_push(cur, prio);
             }
         }
     }
@@ -269,9 +396,9 @@ extern "C" fn heartbeat_task(beats: usize) {
     puts("\x1b[32m[HeartBeat] exit\x1b[0m\n");
 }
 
-pub fn sched() {
+pub fn sched(policy: SchedPolicy) {
     unsafe {
-        KERNEL = Kernel::new();
+        KERNEL = Kernel::new(policy);
     }
     task_create("Worker1", worker_task, 1, 2);
     task_create("Worker2", worker_task, 2, 3);

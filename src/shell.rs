@@ -712,6 +712,7 @@ pub fn run(fs: &mut Fat12<'_>) {
         match cmd {
             b"help" => {
                 puts("help   - show commands\n");
+                puts("sched  - run scheduler (prio|rr)\n");
                 puts("browse - open file browser\n");
                 puts("dir    - list directory\n");
                 puts("touch  - create file\n");
@@ -722,7 +723,13 @@ pub fn run(fs: &mut Fat12<'_>) {
                 puts("format - format FAT12 disk\n");
             }
             b"sched" => {
-                crate::task::sched();
+                match arg {
+                    b"prio" => crate::task::sched(crate::task::SchedPolicy::Prio),
+                    b"rr" | b"" => crate::task::sched(crate::task::SchedPolicy::Rr),
+                    _ => {
+                        puts("Usage: sched [prio|rr]\n");
+                    }
+                }
             }
             b"browse" => {
                 current_dir = browser(fs, current_dir);
