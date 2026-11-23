@@ -5,17 +5,58 @@ use crate::shell::puts;
 
 const STACK_SIZE: usize = 4096;
 const CTX_FRAME_SIZE: usize = 112;
-const ROUNDS: usize = 3;
 
 #[repr(align(16))]
 struct Stack([u8; STACK_SIZE]);
 
-static mut STACK_A: Stack = Stack([0; STACK_SIZE]);
-static mut STACK_B: Stack = Stack([0; STACK_SIZE]);
+const MAX_TASKS: usize = 8;
 
-static mut SHELL_SP: usize = 0;
-static mut SP_A: usize = 0;
-static mut SP_B: usize = 0;
+#[derive(Copy, Clone, PartialEq)]
+enum TaskState {
+    Unused,
+    Ready,
+    Running,
+}
+
+#[derive(Copy, Clone)]
+struct Tcb {
+    sp: usize,
+    state: TaskState,
+    prio: u8,
+    name: &'static str,
+}
+
+impl Tcb {
+    const fn empty() -> Self {
+        Self {
+            sp: 0,
+            state: TaskState::Unused,
+            prio: 0,
+            name: "",
+        }
+    }
+}
+
+struct Kernel {
+    tcbs: [Tcb; MAX_TASKS],
+    used_mask: u32,
+    current: Option<usize>,
+    shell_sp: usize,
+}
+
+impl Kernel {
+    const fn new() -> Self {
+        Self {
+            tcbs: [Tcb::empty(); MAX_TASKS],
+            used_mask: 0,
+            current: None,
+            shell_sp: 0,
+        }
+    }
+}
+
+static mut KERNEL: Kernel = Kernel::new();
+static mut STACKS: [Stack; MAX_TASKS] = [const { Stack([0; STACK_SIZE]) }; MAX_TASKS];
 
 global_asm!(
     r#"
@@ -56,14 +97,21 @@ __switch:
     addi sp, sp, 112
     ret
 
+    .global task_trampoline
+task_trampoline:
+    mv a0, s1
+    jalr s0
+    call task_exit
 "#
 );
 
 unsafe extern "C" {
     fn __switch(old_sp: *mut usize, new_sp: usize);
+    fn task_trampoline();
 }
 
-fn init_stack(stack: *mut u8, entry: extern "C" fn() -> !) -> usize {
+fn init_stack(tid: usize, entry: extern "C" fn(usize), arg: usize) -> usize {
+    let stack = unsafe { (&raw mut STACKS[tid]).cast::<u8>() };
     let top = (stack as usize + STACK_SIZE) & !0xF;
     let sp = top - CTX_FRAME_SIZE;
     let frame = sp as *mut usize;
@@ -71,51 +119,164 @@ fn init_stack(stack: *mut u8, entry: extern "C" fn() -> !) -> usize {
         for i in 0..(CTX_FRAME_SIZE / size_of::<usize>()) {
             frame.add(i).write(0);
         }
-        frame.write(entry as usize);
+        frame.add(0).write(task_trampoline as usize);
+        frame.add(1).write(entry as usize);
+        frame.add(2).write(arg);
     }
     sp
 }
 
-extern "C" fn task_a() -> ! {
-    for _ in 0..ROUNDS {
-        puts("[Task A]\n");
-        unsafe {
-            __switch(&raw mut SP_A, SP_B);
-        }
-    }
-    loop {
-        unsafe {
-            __switch(&raw mut SP_A, SHELL_SP);
-        }
-    }
-}
-
-extern "C" fn task_b() -> ! {
-    for i in 0..ROUNDS {
-        puts("[Task B]\n");
-        if i + 1 < ROUNDS {
-            unsafe {
-                __switch(&raw mut SP_B, SP_A);
-            }
-        } else {
-            unsafe {
-                __switch(&raw mut SP_B, SHELL_SP);
-            }
-        }
-        
-    }
-    loop {
-        unsafe {
-            __switch(&raw mut SP_B, SHELL_SP);
-        }
-    }
-}
-
-pub fn demo() {
+fn task_create(
+    name: &'static str,
+    entry: extern "C" fn(usize),
+    prio: u8,
+    arg: usize,
+) -> Option<usize> {
     unsafe {
-        SP_A = init_stack((&raw mut STACK_A).cast::<u8>(), task_a);
-        SP_B = init_stack((&raw mut STACK_B).cast::<u8>(), task_b);
-        __switch(&raw mut SHELL_SP, SP_A);
-        puts("sched done\n");
+        let tid = (!KERNEL.used_mask).trailing_zeros() as usize;
+        if tid >= MAX_TASKS {
+            return None;
+        }
+        KERNEL.used_mask |= 1 << tid;
+        let sp = init_stack(tid, entry, arg);
+        KERNEL.tcbs[tid] = Tcb {
+            sp,
+            state: TaskState::Ready,
+            prio,
+            name,
+        };
+        Some(tid)
     }
+}
+
+fn task_delete(tid: usize) {
+    if tid >= MAX_TASKS {
+        return;
+    }
+    unsafe {
+        KERNEL.used_mask &= !(1 << tid);
+        KERNEL.tcbs[tid].state = TaskState::Unused;
+    }
+}
+
+fn schedule() {
+    unsafe {
+        let prev = KERNEL.current;
+
+        // 从下一个槽位起顺扫一圈 找第一个 Ready 任务
+        let start = match prev {
+            Some(c) => (c + 1) % MAX_TASKS,
+            None => 0,
+        };
+
+        let mut next = None;
+        for offset in 0..MAX_TASKS {
+            let tid = (start + offset) % MAX_TASKS;
+            let state = KERNEL.tcbs[tid].state;
+            if state == TaskState::Ready {
+                next = Some(tid);
+                break;
+            }
+        }
+
+        // 如果只剩当前任务自己直接恢复 Running
+        if next == prev {
+            if let Some(c) = prev {
+                KERNEL.tcbs[c].state = TaskState::Running;
+            }
+            return;
+        }
+
+        // 决定旧 sp 存到哪
+        let mut dummy_sp: usize = 0;
+        let old_sp = match prev {
+            None => &raw mut KERNEL.shell_sp,
+            Some(c) => {
+                let state = KERNEL.tcbs[c].state;
+                if state == TaskState::Unused {
+                    &raw mut dummy_sp
+                } else {
+                    &raw mut KERNEL.tcbs[c].sp
+                }
+            }
+        };
+
+        // 切去下一个任务; 若全部退出则切回 Shell
+        let new_sp = match next {
+            Some(tid) => {
+                KERNEL.tcbs[tid].state = TaskState::Running;
+                KERNEL.current = Some(tid);
+                KERNEL.tcbs[tid].sp
+            }
+            None => {
+                KERNEL.current = None;
+                KERNEL.shell_sp
+            }
+        };
+        __switch(old_sp, new_sp);
+    }
+}
+
+fn task_yield() {
+    unsafe {
+        if let Some(cur) = KERNEL.current {
+            let state = KERNEL.tcbs[cur].state;
+            if state == TaskState::Running {
+                KERNEL.tcbs[cur].state = TaskState::Ready;
+            }
+        }
+    }
+    schedule();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn task_exit() -> ! {
+    unsafe {
+        if let Some(cur) = KERNEL.current {
+            task_delete(cur);
+        }
+    }
+    schedule();
+    loop {}
+}
+
+fn current_name() -> &'static str {
+    unsafe {
+        match KERNEL.current {
+            Some(cur) => KERNEL.tcbs[cur].name,
+            None => "shell",
+        }
+    }
+}
+
+extern "C" fn worker_task(rounds: usize) {
+    for _ in 0..rounds {
+        puts("[");
+        puts(current_name());
+        puts("] working\n");
+        task_yield();
+    }
+    puts("[");
+    puts(current_name());
+    puts("] exiting\n");
+}
+
+extern "C" fn heartbeat_task(beats: usize) {
+    for _ in 0..beats {
+        puts("\x1b[32m[HeartBeat] alive\x1b[0m\n");
+        task_yield();
+    }
+    puts("\x1b[32m[HeartBeat] exit\x1b[0m\n");
+}
+
+pub fn sched() {
+    unsafe {
+        KERNEL = Kernel::new();
+    }
+    task_create("Worker1", worker_task, 1, 2);
+    task_create("Worker2", worker_task, 2, 3);
+    task_create("Worker3", worker_task, 3, 2);
+    task_create("HeartBeat", heartbeat_task, 4, 4);
+    schedule();
+    puts("sched done\n");
 }
