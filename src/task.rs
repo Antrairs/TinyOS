@@ -1,9 +1,9 @@
-use core::arch::global_asm;
+use core::arch::{asm, global_asm};
 use core::mem::size_of;
 
 use crate::shell::puts;
 
-use crate::trap::{start_timer, stop_timer, read_time, disable_irq, enable_irq};
+use crate::trap::{disable_irq, enable_irq, read_time, start_timer, stop_timer, ticks};
 
 const STACK_SIZE: usize = 4096;
 const CTX_FRAME_SIZE: usize = 112;
@@ -18,6 +18,7 @@ enum TaskState {
     Unused,
     Ready,
     Running,
+    Sleeping,
 }
 
 #[derive(Copy, Clone)]
@@ -25,6 +26,7 @@ struct Tcb {
     sp: usize,
     state: TaskState,
     prio: u8,
+    wake_tick: usize,
     name: &'static str,
 }
 
@@ -34,6 +36,7 @@ impl Tcb {
             sp: 0,
             state: TaskState::Unused,
             prio: 0,
+            wake_tick: 0,
             name: "",
         }
     }
@@ -278,6 +281,7 @@ fn task_create(
             sp,
             state: TaskState::Ready,
             prio,
+            wake_tick: 0,
             name,
         };
         ready_push(tid, prio);
@@ -295,7 +299,7 @@ fn task_delete(tid: usize) {
             let prio = KERNEL.tcbs[tid].prio;
             ready_remove(tid, prio);
         }
-        
+
         KERNEL.used_mask &= !(1 << tid);
         KERNEL.tcbs[tid].state = TaskState::Unused;
     }
@@ -305,7 +309,15 @@ fn schedule() {
     unsafe {
         let prev = KERNEL.current;
 
-        let next = ready_pop();
+        let mut next = ready_pop();
+        while next.is_none() && KERNEL.used_mask != 0 {
+            KERNEL.current = None;
+            enable_irq();
+            asm!("wfi");
+            disable_irq();
+            KERNEL.current = prev;
+            next = ready_pop();
+        }
 
         // 如果只剩当前任务自己直接恢复 Running
         if next == prev {
@@ -346,7 +358,15 @@ fn schedule() {
 }
 
 pub fn on_tick() {
+    let now = ticks();
     unsafe {
+        for tid in 0..MAX_TASKS {
+            if KERNEL.tcbs[tid].state == TaskState::Sleeping && KERNEL.tcbs[tid].wake_tick <= now {
+                KERNEL.tcbs[tid].state = TaskState::Ready;
+                let prio = KERNEL.tcbs[tid].prio;
+                ready_push(tid, prio);
+            }
+        }
         let Some(cur) = KERNEL.current else {
             return;
         };
@@ -369,6 +389,22 @@ fn task_yield() {
                 let prio = KERNEL.tcbs[cur].prio;
                 ready_push(cur, prio);
             }
+        }
+    }
+    schedule();
+    enable_irq();
+}
+
+fn task_sleep(n: usize) {
+    if n == 0 {
+        task_yield();
+        return;
+    }
+    disable_irq();
+    unsafe {
+        if let Some(cur) = KERNEL.current {
+            KERNEL.tcbs[cur].state = TaskState::Sleeping;
+            KERNEL.tcbs[cur].wake_tick = ticks() + n;
         }
     }
     schedule();
@@ -416,7 +452,7 @@ extern "C" fn worker_task(rounds: usize) {
 extern "C" fn heartbeat_task(beats: usize) {
     for _ in 0..beats {
         puts("\x1b[32m[HeartBeat] alive\x1b[0m\n");
-        task_yield();
+        task_sleep(2);
     }
     puts("\x1b[32m[HeartBeat] exit\x1b[0m\n");
 }
@@ -428,7 +464,7 @@ pub fn sched(policy: SchedPolicy) {
     task_create("Worker1", worker_task, 1, 2);
     task_create("Worker2", worker_task, 2, 3);
     task_create("Worker3", worker_task, 3, 2);
-    task_create("HeartBeat", heartbeat_task, 4, 4);
+    task_create("HeartBeat", heartbeat_task, 0, 4);
     start_timer();
     schedule();
     stop_timer();
