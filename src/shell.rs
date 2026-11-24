@@ -2,7 +2,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::fat12::{Fat12, to_83};
 
-use crate::task::{SchedPolicy, Semaphore, sched, sync};
+use crate::task::{SchedPolicy, Semaphore, ps, sched, sync};
 use crate::trap::{irq_restore, irq_save};
 
 const RESET: &str = "\x1b[0m";
@@ -100,9 +100,7 @@ pub fn uart_isr() {
 fn getchar() -> u8 {
     unsafe { (*(&raw mut RX_SEM)).wait() };
     let saved = irq_save();
-    let c = unsafe {
-        (*(&raw mut RX_BUF)).pop().unwrap_or(0)
-    };
+    let c = unsafe { (*(&raw mut RX_BUF)).pop().unwrap_or(0) };
     irq_restore(saved);
     c
 }
@@ -112,9 +110,7 @@ fn try_getchar() -> Option<u8> {
         return None;
     }
     let saved = irq_save();
-    let c = unsafe {
-        (*(&raw mut RX_BUF)).pop()
-    };
+    let c = unsafe { (*(&raw mut RX_BUF)).pop() };
     irq_restore(saved);
     c
 }
@@ -776,6 +772,7 @@ pub fn run(fs: &mut Fat12<'_>) {
         match cmd {
             b"help" => {
                 puts("help   - show commands\n");
+                puts("ps     - list tasks\n");
                 puts("sched  - run scheduler (prio|rr)\n");
                 puts("sync   - run producer/consumer\n");
                 puts("browse - open file browser\n");
@@ -786,6 +783,9 @@ pub fn run(fs: &mut Fat12<'_>) {
                 puts("write  - write file\n");
                 puts("type   - show file content\n");
                 puts("format - format FAT12 disk\n");
+            }
+            b"ps" => {
+                ps();
             }
             b"sched" => match arg {
                 b"prio" => sched(SchedPolicy::Prio),

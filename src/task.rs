@@ -665,3 +665,32 @@ pub fn sync() {
     }
     puts("sync done\n");
 }
+
+pub fn ps() {
+    let saved = irq_save();
+    puts("TID  STATE     PRIO  NAME\n");
+    unsafe {
+        for tid in 0..MAX_TASKS {
+            let tcb = &KERNEL.tcbs[tid];
+            if tcb.state == TaskState::Unused {
+                continue;
+            }
+            let state = match tcb.state {
+                TaskState::Unused => "Unused  ",
+                TaskState::Ready => "Ready   ",
+                TaskState::Running => "Running ",
+                TaskState::Sleeping => "Sleeping",
+                TaskState::Blocked => "Blocked ",
+            };
+            print_number(tid as u32);
+            puts("    ");
+            puts(state);
+            puts("  ");
+            print_number(tcb.prio as u32);
+            puts("    ");
+            puts(tcb.name);
+            puts("\n");
+        }
+    }
+    irq_restore(saved);
+}
