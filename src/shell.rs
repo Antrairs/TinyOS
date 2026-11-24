@@ -2,6 +2,8 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::fat12::{Fat12, to_83};
 
+use crate::task::{SchedPolicy, sched, sync};
+
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";
 const BLUE: &str = "\x1b[34m";
@@ -158,7 +160,7 @@ fn print_name(name: &[u8; 11]) {
     }
 }
 
-fn print_number(mut value: u32) -> usize {
+pub fn print_number(mut value: u32) -> usize {
     let mut digits = [0u8; 10];
     let mut start = digits.len();
 
@@ -713,6 +715,7 @@ pub fn run(fs: &mut Fat12<'_>) {
             b"help" => {
                 puts("help   - show commands\n");
                 puts("sched  - run scheduler (prio|rr)\n");
+                puts("sync   - run producer/consumer\n");
                 puts("browse - open file browser\n");
                 puts("dir    - list directory\n");
                 puts("touch  - create file\n");
@@ -722,14 +725,15 @@ pub fn run(fs: &mut Fat12<'_>) {
                 puts("type   - show file content\n");
                 puts("format - format FAT12 disk\n");
             }
-            b"sched" => {
-                match arg {
-                    b"prio" => crate::task::sched(crate::task::SchedPolicy::Prio),
-                    b"rr" | b"" => crate::task::sched(crate::task::SchedPolicy::Rr),
-                    _ => {
-                        puts("Usage: sched [prio|rr]\n");
-                    }
+            b"sched" => match arg {
+                b"prio" => sched(SchedPolicy::Prio),
+                b"rr" | b"" => sched(SchedPolicy::Rr),
+                _ => {
+                    puts("Usage: sched [prio|rr]\n");
                 }
+            },
+            b"sync" => {
+                sync();
             }
             b"browse" => {
                 current_dir = browser(fs, current_dir);

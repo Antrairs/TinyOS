@@ -1,7 +1,7 @@
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
 
-use crate::shell::puts;
+use crate::shell::{print_number, puts};
 
 use crate::trap::{disable_irq, enable_irq, read_time, start_timer, stop_timer, ticks};
 
@@ -14,6 +14,8 @@ struct Stack([u8; STACK_SIZE]);
 const MAX_TASKS: usize = 8;
 
 static mut UART_LOCK: Semaphore = Semaphore::new(1);
+
+const BUF_CAP: usize = 3;
 
 #[derive(Copy, Clone, PartialEq)]
 enum TaskState {
@@ -481,11 +483,15 @@ fn current_name() -> &'static str {
 }
 
 fn log_msg(prefix: &str, name: &str, suffix: &str) {
-    unsafe { (*(&raw mut UART_LOCK)).wait(); }
+    unsafe {
+        (*(&raw mut UART_LOCK)).wait();
+    }
     puts(prefix);
     puts(name);
     puts(suffix);
-    unsafe {(*(&raw mut UART_LOCK)).post(); }
+    unsafe {
+        (*(&raw mut UART_LOCK)).post();
+    }
 }
 
 fn busy_wait(cycles: u64) {
@@ -522,4 +528,91 @@ pub fn sched(policy: SchedPolicy) {
     schedule();
     stop_timer();
     puts("sched done\n");
+}
+
+struct BoundedBuf {
+    buf: [usize; BUF_CAP],
+    head: usize,
+    tail: usize,
+    empty: Semaphore,
+    full: Semaphore,
+    lock: Semaphore,
+}
+
+impl BoundedBuf {
+    const fn new() -> Self {
+        Self {
+            buf: [0; BUF_CAP],
+            head: 0,
+            tail: 0,
+            empty: Semaphore::new(BUF_CAP),
+            full: Semaphore::new(0),
+            lock: Semaphore::new(1),
+        }
+    }
+
+    fn push(&mut self, item: usize) {
+        self.empty.wait();
+        self.lock.wait();
+        self.buf[self.tail] = item;
+        self.tail = (self.tail + 1) % BUF_CAP;
+        self.lock.post();
+        self.full.post();
+    }
+
+    fn pop(&mut self) -> usize {
+        self.full.wait();
+        self.lock.wait();
+        let item = self.buf[self.head];
+        self.head = (self.head + 1) % BUF_CAP;
+        self.lock.post();
+        self.empty.post();
+        item
+    }
+}
+
+static mut CHAN: BoundedBuf = BoundedBuf::new();
+
+fn log_item(action: &str, item: usize) {
+    unsafe {
+        (*(&raw mut UART_LOCK)).wait();
+    }
+    puts("[");
+    puts(current_name());
+    puts("] ");
+    puts(action);
+    print_number(item as u32);
+    puts("\n");
+    unsafe {
+        (*(&raw mut UART_LOCK)).post();
+    }
+}
+
+extern "C" fn producer_task(count: usize) {
+    for i in 1..=count {
+        unsafe { (*(&raw mut CHAN)).push(i) };
+        log_item("put ", i);
+    }
+}
+
+extern "C" fn consumer_task(count: usize) {
+    for _ in 0..count {
+        let item = unsafe { (*(&raw mut CHAN)).pop() };
+        log_item("get ", item);
+        task_sleep(2);
+    }
+}
+
+pub fn sync() {
+    unsafe {
+        KERNEL = Kernel::new(SchedPolicy::Prio);
+        UART_LOCK = Semaphore::new(1);
+        CHAN = BoundedBuf::new();
+    }
+    task_create("Consumer", consumer_task, 1, 6);
+    task_create("Producer", producer_task, 2, 6);
+    start_timer();
+    schedule();
+    stop_timer();
+    puts("sync done\n");
 }
