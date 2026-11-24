@@ -13,12 +13,15 @@ struct Stack([u8; STACK_SIZE]);
 
 const MAX_TASKS: usize = 8;
 
+static mut UART_LOCK: Semaphore = Semaphore::new(1);
+
 #[derive(Copy, Clone, PartialEq)]
 enum TaskState {
     Unused,
     Ready,
     Running,
     Sleeping,
+    Blocked,
 }
 
 #[derive(Copy, Clone)]
@@ -138,6 +141,51 @@ impl RingQueue {
         }
         self.tail = (self.head + new_len) % MAX_TASKS;
         self.len = new_len;
+    }
+}
+
+struct Semaphore {
+    count: usize,
+    wait_q: RingQueue,
+}
+
+impl Semaphore {
+    const fn new(count: usize) -> Self {
+        Self {
+            count,
+            wait_q: RingQueue::new(),
+        }
+    }
+
+    fn wait(&mut self) {
+        disable_irq();
+        if self.count > 0 {
+            self.count -= 1;
+            enable_irq();
+            return;
+        }
+        unsafe {
+            if let Some(cur) = KERNEL.current {
+                KERNEL.tcbs[cur].state = TaskState::Blocked;
+                self.wait_q.push(cur);
+            }
+        }
+        schedule();
+        enable_irq();
+    }
+
+    fn post(&mut self) {
+        disable_irq();
+        if let Some(tid) = self.wait_q.pop() {
+            unsafe {
+                KERNEL.tcbs[tid].state = TaskState::Ready;
+                let prio = KERNEL.tcbs[tid].prio;
+                ready_push(tid, prio);
+            }
+        } else {
+            self.count += 1;
+        }
+        enable_irq();
     }
 }
 
@@ -432,6 +480,14 @@ fn current_name() -> &'static str {
     }
 }
 
+fn log_msg(prefix: &str, name: &str, suffix: &str) {
+    unsafe { (*(&raw mut UART_LOCK)).wait(); }
+    puts(prefix);
+    puts(name);
+    puts(suffix);
+    unsafe {(*(&raw mut UART_LOCK)).post(); }
+}
+
 fn busy_wait(cycles: u64) {
     let end = read_time() + cycles;
     while read_time() < end {}
@@ -439,27 +495,24 @@ fn busy_wait(cycles: u64) {
 
 extern "C" fn worker_task(rounds: usize) {
     for _ in 0..rounds {
-        puts("[");
-        puts(current_name());
-        puts("] working\n");
+        log_msg("[", current_name(), "] working\n");
         busy_wait(1_000_000);
     }
-    puts("[");
-    puts(current_name());
-    puts("] exiting\n");
+    log_msg("[", current_name(), "] exiting\n");
 }
 
 extern "C" fn heartbeat_task(beats: usize) {
     for _ in 0..beats {
-        puts("\x1b[32m[HeartBeat] alive\x1b[0m\n");
+        log_msg("\x1b[32m[HeartBeat] alive\x1b[0m\n", "", "");
         task_sleep(2);
     }
-    puts("\x1b[32m[HeartBeat] exit\x1b[0m\n");
+    log_msg("\x1b[32m[HeartBeat] exit\x1b[0m\n", "", "");
 }
 
 pub fn sched(policy: SchedPolicy) {
     unsafe {
         KERNEL = Kernel::new(policy);
+        UART_LOCK = Semaphore::new(1);
     }
     task_create("Worker1", worker_task, 1, 2);
     task_create("Worker2", worker_task, 2, 3);
