@@ -3,6 +3,7 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::fat12::{Fat12, to_83};
 
 use crate::task::{SchedPolicy, Semaphore, sched, sync};
+use crate::trap::{irq_restore, irq_save};
 
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";
@@ -50,7 +51,12 @@ struct RxBuf {
 
 impl RxBuf {
     const fn new() -> Self {
-        Self { buf: [0; RX_BUF_CAP], head: 0, tail: 0, len: 0 }
+        Self {
+            buf: [0; RX_BUF_CAP],
+            head: 0,
+            tail: 0,
+            len: 0,
+        }
     }
 
     fn push(&mut self, c: u8) -> bool {
@@ -82,7 +88,7 @@ pub fn uart_isr() {
     const RX_READY: u8 = 1;
 
     unsafe {
-        if read_volatile((UART0 + LSR) as *const u8) & RX_READY != 0 {
+        while read_volatile((UART0 + LSR) as *const u8) & RX_READY != 0 {
             let c = read_volatile(UART0 as *const u8);
             if (*(&raw mut RX_BUF)).push(c) {
                 (*(&raw mut RX_SEM)).post();
@@ -92,26 +98,25 @@ pub fn uart_isr() {
 }
 
 fn getchar() -> u8 {
-    const LSR: usize = 5;
-    const RX_READY: u8 = 1;
-
-    unsafe {
-        while read_volatile((UART0 + LSR) as *const u8) & RX_READY == 0 {}
-        read_volatile(UART0 as *const u8)
-    }
+    unsafe { (*(&raw mut RX_SEM)).wait() };
+    let saved = irq_save();
+    let c = unsafe {
+        (*(&raw mut RX_BUF)).pop().unwrap_or(0)
+    };
+    irq_restore(saved);
+    c
 }
 
 fn try_getchar() -> Option<u8> {
-    const LSR: usize = 5;
-    const RX_READY: u8 = 1;
-
-    unsafe {
-        if read_volatile((UART0 + LSR) as *const u8) & RX_READY == 0 {
-            None
-        } else {
-            Some(read_volatile(UART0 as *const u8))
-        }
+    if !unsafe { (*(&raw mut RX_SEM)).try_wait() } {
+        return None;
     }
+    let saved = irq_save();
+    let c = unsafe {
+        (*(&raw mut RX_BUF)).pop()
+    };
+    irq_restore(saved);
+    c
 }
 
 fn read_line(buf: &mut [u8]) -> usize {
@@ -733,6 +738,11 @@ fn browser(fs: &mut Fat12<'_>, start_dir: u16) -> u16 {
             _ => {}
         }
     }
+}
+
+pub extern "C" fn shell_task(fs_ptr: usize) {
+    let fs = unsafe { &mut *(fs_ptr as *mut Fat12<'_>) };
+    run(fs);
 }
 
 pub fn run(fs: &mut Fat12<'_>) {

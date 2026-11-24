@@ -10,6 +10,7 @@ mod fat12;
 use fat12::Fat12;
 
 mod virtio;
+use crate::task::start_os;
 use crate::virtio::VirtioBlock;
 
 mod shell;
@@ -54,9 +55,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     let mut fs = Fat12::new(&mut disk);
 
-    shell::run(&mut fs);
-
-    halt();
+    start_os(shell::shell_task, &mut fs as *mut Fat12<'_> as usize);
 }
 
 fn halt() -> ! {

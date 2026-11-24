@@ -4,10 +4,10 @@ use core::mem::size_of;
 use crate::shell::{print_number, puts};
 
 use crate::trap::{
-    disable_irq, enable_irq, irq_restore, irq_save, read_time, start_timer, stop_timer, ticks,
+    disable_irq, enable_irq, init_uart_irq, irq_restore, irq_save, read_time, start_timer, ticks,
 };
 
-const STACK_SIZE: usize = 4096;
+const STACK_SIZE: usize = 1024 * 32;
 const CTX_FRAME_SIZE: usize = 112;
 
 #[repr(align(16))]
@@ -16,6 +16,7 @@ struct Stack([u8; STACK_SIZE]);
 const MAX_TASKS: usize = 8;
 
 static mut UART_LOCK: Semaphore = Semaphore::new(1);
+static mut DONE_SEM: Semaphore = Semaphore::new(0);
 
 const BUF_CAP: usize = 3;
 
@@ -519,6 +520,9 @@ extern "C" fn worker_task(rounds: usize) {
         busy_wait(1_000_000);
     }
     log_msg("[", current_name(), "] exiting\n");
+    unsafe {
+        (*(&raw mut DONE_SEM)).post();
+    }
 }
 
 extern "C" fn heartbeat_task(beats: usize) {
@@ -527,20 +531,40 @@ extern "C" fn heartbeat_task(beats: usize) {
         task_sleep(2);
     }
     log_msg("\x1b[32m[HeartBeat] exit\x1b[0m\n", "", "");
+    unsafe {
+        (*(&raw mut DONE_SEM)).post();
+    }
+}
+
+pub fn start_os(entry: extern "C" fn(usize), arg: usize) -> ! {
+    unsafe {
+        KERNEL = Kernel::new(SchedPolicy::Prio);
+        UART_LOCK = Semaphore::new(1);
+    }
+    task_create("Shell", entry, 10, arg);
+    start_timer();
+    init_uart_irq();
+    schedule();
+    loop {}
 }
 
 pub fn sched(policy: SchedPolicy) {
+    let saved = irq_save();
     unsafe {
-        KERNEL = Kernel::new(policy);
-        UART_LOCK = Semaphore::new(1);
+        KERNEL.policy = policy;
+        DONE_SEM = Semaphore::new(0);
     }
     task_create("Worker1", worker_task, 1, 2);
     task_create("Worker2", worker_task, 2, 3);
     task_create("Worker3", worker_task, 3, 2);
     task_create("HeartBeat", heartbeat_task, 0, 4);
-    start_timer();
-    schedule();
-    stop_timer();
+    irq_restore(saved);
+
+    for _ in 0..4 {
+        unsafe {
+            (*(&raw mut DONE_SEM)).wait();
+        }
+    }
     puts("sched done\n");
 }
 
@@ -607,6 +631,9 @@ extern "C" fn producer_task(count: usize) {
         unsafe { (*(&raw mut CHAN)).push(i) };
         log_item("put ", i);
     }
+    unsafe {
+        (*(&raw mut DONE_SEM)).post();
+    }
 }
 
 extern "C" fn consumer_task(count: usize) {
@@ -615,18 +642,26 @@ extern "C" fn consumer_task(count: usize) {
         log_item("get ", item);
         task_sleep(2);
     }
+    unsafe {
+        (*(&raw mut DONE_SEM)).post();
+    }
 }
 
 pub fn sync() {
+    let saved = irq_save();
     unsafe {
-        KERNEL = Kernel::new(SchedPolicy::Prio);
-        UART_LOCK = Semaphore::new(1);
+        KERNEL.policy = SchedPolicy::Prio;
         CHAN = BoundedBuf::new();
+        DONE_SEM = Semaphore::new(0);
     }
     task_create("Consumer", consumer_task, 1, 6);
     task_create("Producer", producer_task, 2, 6);
-    start_timer();
-    schedule();
-    stop_timer();
+    irq_restore(saved);
+
+    for _ in 0..2 {
+        unsafe {
+            (*(&raw mut DONE_SEM)).wait();
+        }
+    }
     puts("sync done\n");
 }
