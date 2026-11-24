@@ -2,7 +2,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use crate::fat12::{Fat12, to_83};
 
-use crate::task::{SchedPolicy, sched, sync};
+use crate::task::{SchedPolicy, Semaphore, sched, sync};
 
 const RESET: &str = "\x1b[0m";
 const CYAN: &str = "\x1b[36m";
@@ -36,6 +36,58 @@ fn putchar(c: u8) {
 pub fn puts(s: &str) {
     for c in s.bytes() {
         putchar(c);
+    }
+}
+
+const RX_BUF_CAP: usize = 64;
+
+struct RxBuf {
+    buf: [u8; RX_BUF_CAP],
+    head: usize,
+    tail: usize,
+    len: usize,
+}
+
+impl RxBuf {
+    const fn new() -> Self {
+        Self { buf: [0; RX_BUF_CAP], head: 0, tail: 0, len: 0 }
+    }
+
+    fn push(&mut self, c: u8) -> bool {
+        if self.len >= RX_BUF_CAP {
+            return false;
+        }
+        self.buf[self.tail] = c;
+        self.tail = (self.tail + 1) % RX_BUF_CAP;
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.len == 0 {
+            return None;
+        }
+        let c = self.buf[self.head];
+        self.head = (self.head + 1) % RX_BUF_CAP;
+        self.len -= 1;
+        Some(c)
+    }
+}
+
+static mut RX_BUF: RxBuf = RxBuf::new();
+static mut RX_SEM: Semaphore = Semaphore::new(0);
+
+pub fn uart_isr() {
+    const LSR: usize = 5;
+    const RX_READY: u8 = 1;
+
+    unsafe {
+        if read_volatile((UART0 + LSR) as *const u8) & RX_READY != 0 {
+            let c = read_volatile(UART0 as *const u8);
+            if (*(&raw mut RX_BUF)).push(c) {
+                (*(&raw mut RX_SEM)).post();
+            }
+        }
     }
 }
 

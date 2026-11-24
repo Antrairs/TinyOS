@@ -3,7 +3,9 @@ use core::mem::size_of;
 
 use crate::shell::{print_number, puts};
 
-use crate::trap::{disable_irq, enable_irq, read_time, start_timer, stop_timer, ticks};
+use crate::trap::{
+    disable_irq, enable_irq, irq_restore, irq_save, read_time, start_timer, stop_timer, ticks,
+};
 
 const STACK_SIZE: usize = 4096;
 const CTX_FRAME_SIZE: usize = 112;
@@ -146,24 +148,24 @@ impl RingQueue {
     }
 }
 
-struct Semaphore {
+pub struct Semaphore {
     count: usize,
     wait_q: RingQueue,
 }
 
 impl Semaphore {
-    const fn new(count: usize) -> Self {
+    pub const fn new(count: usize) -> Self {
         Self {
             count,
             wait_q: RingQueue::new(),
         }
     }
 
-    fn wait(&mut self) {
-        disable_irq();
+    pub fn wait(&mut self) {
+        let saved = irq_save();
         if self.count > 0 {
             self.count -= 1;
-            enable_irq();
+            irq_restore(saved);
             return;
         }
         unsafe {
@@ -173,11 +175,23 @@ impl Semaphore {
             }
         }
         schedule();
-        enable_irq();
+        irq_restore(saved);
     }
 
-    fn post(&mut self) {
-        disable_irq();
+    pub fn try_wait(&mut self) -> bool {
+        let saved = irq_save();
+        let ok = if self.count > 0 {
+            self.count -= 1;
+            true
+        } else {
+            false
+        };
+        irq_restore(saved);
+        ok
+    }
+
+    pub fn post(&mut self) {
+        let saved = irq_save();
         if let Some(tid) = self.wait_q.pop() {
             unsafe {
                 KERNEL.tcbs[tid].state = TaskState::Ready;
@@ -187,7 +201,7 @@ impl Semaphore {
         } else {
             self.count += 1;
         }
-        enable_irq();
+        irq_restore(saved);
     }
 }
 
@@ -430,7 +444,7 @@ pub fn on_tick() {
 }
 
 fn task_yield() {
-    disable_irq();
+    let saved = irq_save();
     unsafe {
         if let Some(cur) = KERNEL.current {
             let state = KERNEL.tcbs[cur].state;
@@ -442,7 +456,7 @@ fn task_yield() {
         }
     }
     schedule();
-    enable_irq();
+    irq_restore(saved);
 }
 
 fn task_sleep(n: usize) {
@@ -450,7 +464,7 @@ fn task_sleep(n: usize) {
         task_yield();
         return;
     }
-    disable_irq();
+    let saved = irq_save();
     unsafe {
         if let Some(cur) = KERNEL.current {
             KERNEL.tcbs[cur].state = TaskState::Sleeping;
@@ -458,7 +472,7 @@ fn task_sleep(n: usize) {
         }
     }
     schedule();
-    enable_irq();
+    irq_restore(saved);
 }
 
 #[unsafe(no_mangle)]
